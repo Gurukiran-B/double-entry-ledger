@@ -195,7 +195,7 @@ def transfer(
         connection.rollback()
         raise
     finally:
-        if original_autocommit:
+        if original_autocommit and not connection.closed:
             connection.autocommit = True
 
 
@@ -330,5 +330,5 @@ def transfer_idempotently(
         connection.rollback()
         raise
     finally:
-        if original_autocommit:
+        if original_autocommit and not connection.closed:
             connection.autocommit = True

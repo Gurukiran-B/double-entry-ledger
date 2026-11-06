@@ -6,6 +6,7 @@ import psycopg
 import pytest
 
 from ledger.config import DATABASE_URL
+from ledger.transfer import transfer, transfer_idempotently
 
 
 def test_runtime_role_has_least_privilege_and_can_lock_accounts() -> None:
@@ -216,3 +217,97 @@ def test_runtime_role_cannot_mutate_protected_rows(statement: str) -> None:
         psycopg.errors.InsufficientPrivilege
     ):
         connection.execute(statement)
+
+
+def test_unbalanced_transaction_rejected_at_commit() -> None:
+    owner_id = uuid4()
+    account_a = uuid4()
+    account_b = uuid4()
+    tx_id = uuid4()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO ledger.owners (id, name) VALUES (%s, %s)",
+                    (owner_id, f"unbalanced-{owner_id}"),
+                )
+                cursor.execute(
+                    "INSERT INTO ledger.accounts (id, owner_id, name) VALUES (%s, %s, %s), (%s, %s, %s)",
+                    (account_a, owner_id, "acc-a", account_b, owner_id, "acc-b"),
+                )
+                cursor.execute(
+                    "INSERT INTO ledger.transactions (id, created_by) VALUES (%s, %s)",
+                    (tx_id, owner_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO ledger.entries (transaction_id, account_id, amount_minor)
+                    VALUES (%s, %s, %s), (%s, %s, %s)
+                    """,
+                    (tx_id, account_a, -100, tx_id, account_b, 200),
+                )
+
+            with pytest.raises(psycopg.errors.CheckViolation, match="is unbalanced"):
+                connection.commit()
+        finally:
+            connection.rollback()
+
+
+def test_single_entry_transaction_rejected_at_commit() -> None:
+    owner_id = uuid4()
+    account_id = uuid4()
+    tx_id = uuid4()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO ledger.owners (id, name) VALUES (%s, %s)",
+                    (owner_id, f"single-entry-{owner_id}"),
+                )
+                cursor.execute(
+                    "INSERT INTO ledger.accounts (id, owner_id, name) VALUES (%s, %s, %s)",
+                    (account_id, owner_id, "acc-single"),
+                )
+                cursor.execute(
+                    "INSERT INTO ledger.transactions (id, created_by) VALUES (%s, %s)",
+                    (tx_id, owner_id),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO ledger.entries (transaction_id, account_id, amount_minor)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (tx_id, account_id, -100),
+                )
+
+            with pytest.raises(psycopg.errors.CheckViolation, match="is unbalanced"):
+                connection.commit()
+        finally:
+            connection.rollback()
+
+
+def test_transfer_rejects_identical_source_and_destination() -> None:
+    account_id = uuid4()
+    owner_id = uuid4()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(ValueError, match="Source and destination accounts must be different"):
+            transfer(connection, account_id, account_id, 100, owner_id)
+
+        with pytest.raises(ValueError, match="Source and destination accounts must be different"):
+            transfer_idempotently(connection, account_id, account_id, 100, owner_id, "key-1")
+
+
+def test_transfer_idempotently_validates_key_length() -> None:
+    source_id = uuid4()
+    dest_id = uuid4()
+    owner_id = uuid4()
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with pytest.raises(ValueError, match="Idempotency key must contain 1–255 characters"):
+            transfer_idempotently(connection, source_id, dest_id, 100, owner_id, "")
+
+        with pytest.raises(ValueError, match="Idempotency key must contain 1–255 characters"):
+            transfer_idempotently(connection, source_id, dest_id, 100, owner_id, "x" * 256)
