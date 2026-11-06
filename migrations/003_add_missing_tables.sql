@@ -1,0 +1,5 @@
+-- Migration 003 is intentionally a no-op.
+--
+-- The accounts and transactions tables were already created by
+-- migration 002. This migration is retained to preserve the
+-- migration sequence and historical record.
