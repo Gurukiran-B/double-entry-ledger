@@ -1,10 +1,8 @@
-# Double-Entry Ledger Service
+# Double-Entry Ledger Prototype
 
-A correctness-focused, ACID-compliant double-entry ledger backend implemented in Python 3.12 and PostgreSQL 16. The service is engineered to guarantee financial invariants: money cannot be created or destroyed out of thin air, account balances cannot be overdrawn concurrently, transaction history is immutable, and duplicate requests are handled idempotently.
+A Python 3.12 library and PostgreSQL 16 schema for exploring atomic, double-entry transfers, row-level locking, and idempotent retries. It is an engineering prototype, not a production banking platform.
 
-The repository includes a production transfer engine alongside deterministic experiment suites demonstrating concurrency bugs (overdraft races, lost updates, deadlocks) and the architectural mechanisms that eliminate them.
-
-> **Scope Notice:** This project currently provides an in-process Python library and a migration runner. It enforces transaction safety, database-level security, and idempotency at the database and service boundaries. A minimal REST API integration (FastAPI) is evaluated in the design documentation for future HTTP exposure.
+There is **no REST API and no authentication**. `created_by` is supplied by the library caller; it is not an authenticated identity. The repository includes deterministic experiments showing common transaction and concurrency failure modes.
 
 ---
 
@@ -61,7 +59,7 @@ When executing an idempotent transfer (`transfer_idempotently`):
 4. **Row-Level Account Locking:**
    - If claimed, locks both `source_account_id` and `destination_account_id` in deterministic ascending UUID order via `ledger.lock_account_for_update(uuid)`.
 5. **Authorization & Balance Verification:**
-   - Asserts that the authenticated owner (`created_by`) owns the source account.
+   - Asserts that the caller-supplied owner (`created_by`) owns the source account.
    - Calculates the source account's real-time balance (`COALESCE(SUM(amount_minor), 0)`).
    - Raises `InsufficientFundsError` if `source_balance < amount_minor`.
 6. **Double-Entry Insertion:**
@@ -83,7 +81,7 @@ When executing an idempotent transfer (`transfer_idempotently`):
 - **Database:** PostgreSQL 16
 - **Database Driver:** Psycopg 3 (`psycopg[binary]`)
 - **Containerization:** Docker & Docker Compose
-- **Quality & Testing:** pytest, pytest-timeout, Ruff, Mypy (strict type checking enabled)
+- **Quality & Testing:** pytest, pytest-timeout, Ruff, Mypy
 - **Packaging:** Setuptools (PEP 621 compliant `pyproject.toml`)
 
 ---
@@ -178,17 +176,22 @@ This ledger enforces **pure double-entry book-keeping**:
    $$\text{Balance}(A) = \sum_{e \in \text{Entries}(A)} e.\text{amount\_minor}$$
 2. **Zero-Sum Transactions:** Every transaction must have at least two entries whose amounts sum exactly to zero:
    $$\sum_{e \in \text{Transaction}} e.\text{amount\_minor} = 0$$
-   This is enforced at the database level by PostgreSQL deferred constraint triggers (`transactions_must_balance` and `entries_must_balance`). Money cannot be created or destroyed.
+   This is enforced at commit by PostgreSQL deferred constraint triggers (`transactions_must_balance` and `entries_must_balance`). This checks transaction balance, not account ownership or overdraft policy; direct SQL writers can still create balanced transactions outside the transfer function.
 3. **Integer Money Representation:** Currency amounts are strictly represented in minor units (e.g., cents, pence) as 64-bit integers (`BIGINT`). Floating-point types (`REAL`, `FLOAT`, `DOUBLE PRECISION`) are prohibited to eliminate binary rounding errors.
+
+### Funding and Negative Balances
+
+The `allow_negative` account column is stored but is not consulted by the transfer implementation: `transfer` and `transfer_idempotently` reject any transfer that would leave the source below zero, regardless of that flag. There is no public deposit, withdrawal, account-creation, or initial-funding function. Tests seed starting balances using balanced entries directly. The so-called system/funding accounts in fixtures are ordinary owner-linked accounts, not a special system-account type. Do not treat test seeding as a supported funding workflow.
 
 ---
 
 ## Atomicity, Isolation & Idempotency
 
 ### Atomicity & Transaction Boundaries
-- All ledger modifications occur within a single database transaction (`BEGIN ... COMMIT`).
-- If an unhandled exception or constraint failure occurs, Psycopg issues `ROLLBACK`, guaranteeing that half-transfers or dangling debits can never exist.
-- Autocommit state is restored safely only if the connection remains open.
+- Each public transfer function commits or rolls back the transaction on the supplied Psycopg connection, and restores its previous autocommit setting. On failure it rolls back all work in that connection's current transaction.
+- Use a dedicated connection with no unrelated pending work: a successful call commits any pre-existing work on that connection, and a failure can roll it back.
+- Idempotency claim, ledger writes, saved status/body, and commit are one transaction. If the operation fails before commit, its claim is rolled back too.
+- PostgreSQL's default isolation level is used; this project does not configure `SERIALIZABLE`. The transfer path coordinates conflicting operations with account-row locks.
 
 ### Idempotency Guarantee
 Network clients often retry requests after timeouts or disconnects:
@@ -197,6 +200,8 @@ Network clients often retry requests after timeouts or disconnects:
 - The request payload is hashed using SHA-256 (`request_hash`).
 - **Concurrent retries:** If two identical requests hit the server concurrently, the second blocks on PostgreSQL's index row lock. Once the first commits, the second unblocks and re-reads the committed response payload, returning `replayed=True` without re-executing ledger writes.
 - **Conflicting retries:** If an idempotency key is reused with modified amounts or accounts, the hash comparison detects the tampering and rejects the operation with `IdempotencyConflictError`.
+- **Lost response:** After a successful commit, retrying the same owner/key and request returns the saved status and JSON body rather than creating another transfer.
+- **Retention:** No expiry or automatic cleanup is implemented. Idempotency rows remain until explicitly removed or their owner is deleted subject to foreign-key constraints; clients must not assume a retry window or that a key becomes reusable after a period.
 
 ---
 
@@ -209,11 +214,11 @@ When two transfers attempt to debit the same account concurrently, naive systems
 3. Thread A debits \$80, balance becomes \$20.
 4. Thread B debits \$80, account becomes -\$60 (unauthorized overdraft).
 
-This service eliminates TOCTOU races by acquiring an exclusive row-level lock on account rows:
+The transfer function prevents this TOCTOU race on its normal code path by acquiring a PostgreSQL row-level lock on account rows:
 ```sql
 SELECT account.id FROM ledger.accounts WHERE id = p_account_id FOR NO KEY UPDATE;
 ```
-`FOR NO KEY UPDATE` prevents concurrent balance computations while permitting concurrent non-conflicting foreign key validations.
+`FOR NO KEY UPDATE` prevents concurrent balance computations while permitting concurrent non-conflicting foreign key validations. No `SERIALIZABLE` isolation level is set.
 
 ### Deadlock Prevention
 If Thread 1 transfers from Account A to Account B, and Thread 2 transfers from Account B to Account A:
@@ -226,11 +231,11 @@ If Thread 1 transfers from Account A to Account B, and Thread 2 transfers from A
 
 ## Security Design & Database Roles
 
-The database adheres strictly to the **Principle of Least Privilege (PoLP)** with three distinct roles:
+The schema separates migration/admin, runtime, and lock-function roles:
 
 | Role | Login | Superuser | Privileges | Purpose |
 | --- | --- | --- | --- | --- |
-| `ledger_admin` | Yes | Yes / Admin | Full privileges on `ledger` schema | Applies schema migrations and runs test setup/cleanup |
+| `ledger_admin` | Yes | Deployment-dependent (the supplied Docker setup makes it the PostgreSQL bootstrap superuser) | Migration and test setup privileges | Applies schema migrations and runs test setup/cleanup |
 | `ledger_account_locker` | No | No | `USAGE` on schema, `UPDATE (id)` on `ledger.accounts` | Dedicated role that owns the `SECURITY DEFINER` account locking function |
 | `ledger_app` | Yes | No | Minimal DML (details below) | Runtime application role used by the service |
 
@@ -243,6 +248,8 @@ The database adheres strictly to the **Principle of Least Privilege (PoLP)** wit
 - **GRANTED:** `USAGE` on sequence `entries_id_seq` (no `SELECT` privilege to prevent sequence value manipulation).
 - **EXECUTE:** `ledger.lock_account_for_update(uuid)`.
 
+These are role grants, not an authentication or tenant-isolation boundary. `created_by` and the owner UUID are supplied by the caller, and the source-account ownership check is in Python. The runtime role also has direct `INSERT` access to ledger tables, so a holder of its credentials can bypass the transfer function's ownership and overdraft checks (but database constraints still apply). It can also directly change idempotency records, including saved responses. PostgreSQL superusers and sufficiently privileged owners can bypass ordinary grants and disable triggers; immutability and least privilege do not protect against them.
+
 ### Function Hardening (`SECURITY DEFINER`)
 `lock_account_for_update` is owned by `ledger_account_locker` and explicitly sets:
 ```sql
@@ -254,7 +261,7 @@ This protects against search-path hijacking attacks. `ledger_app` can execute th
 To defend against accidental or malicious internal updates:
 - Migration `007_immutable_entries.sql` attaches a `BEFORE UPDATE OR DELETE` trigger on `ledger.entries`.
 - Any modification raises an exception with SQLSTATE `55000` (`Ledger entries are immutable`).
-- Even superusers cannot update or delete entries without explicitly disabling the trigger.
+- This protects normal DML paths; a superuser or privileged table owner can disable/drop the trigger or otherwise bypass it.
 
 ---
 
@@ -266,7 +273,7 @@ Migrations are stored in `migrations/` as numbered SQL files:
 | --- | --- | --- |
 | `001_roles_and_schema.sql` | Schema creation | Creates `ledger` schema and `schema_migrations` table |
 | `002_tables.sql` | Core entities | Creates `owners`, `accounts`, and `transactions` tables |
-| `003_add_missing_tables.sql` | Sequence preserve | No-op preserved for migration history compatibility |
+| `003_add_missing_tables.sql` | Historical no-op | Tables it once referred to were already created by migration 002; retained to preserve applied migration history |
 | `004_entries.sql` | Ledger entries | Creates `entries` table with nonzero and range constraints |
 | `005_idempotency.sql` | Idempotency store | Creates `idempotency_keys` table with composite primary key |
 | `006_application_role_security.sql` | PoLP security | Sets role privileges and deploys `lock_account_for_update` |
@@ -278,7 +285,7 @@ Run the migration module with administrative credentials:
 ```powershell
 python -m ledger.migrate
 ```
-The runner is idempotent: applied versions are recorded in `ledger.schema_migrations` and skipped on subsequent runs.
+The runner records applied filenames in `ledger.schema_migrations` and skips them on subsequent runs. Migration 003 is intentionally empty and must not be rewritten to retrofit a schema change; add a new numbered migration for future changes. Existing applied migration history is not edited.
 
 ---
 
@@ -287,73 +294,98 @@ The runner is idempotent: applied versions are recorded in `ledger.schema_migrat
 Configure the service using environment variables. Placeholders are used below:
 
 ```bash
-# Database connection for the runtime application (PoLP role)
-LEDGER_DATABASE_URL=postgresql://ledger_app:<app-password>@127.0.0.1:5432/ledger
+# Local library database (Docker maps this to host port 5433)
+LEDGER_DATABASE_URL=postgresql://ledger_app:<app-password>@127.0.0.1:5433/ledger
 
-# Database connection for migrations (administrative role)
-LEDGER_MIGRATION_DATABASE_URL=postgresql://ledger_admin:<admin-password>@127.0.0.1:5432/ledger
+# Local migration connection
+LEDGER_MIGRATION_DATABASE_URL=postgresql://ledger_admin:<admin-password>@127.0.0.1:5433/ledger
 
-# Database connection for test execution (points to isolated test DB on port 5433)
-LEDGER_TEST_ADMIN_DATABASE_URL=postgresql://ledger_admin:<admin-password>@127.0.0.1:5433/ledger_test
+# Isolated test database (Docker maps this to host port 5434)
+LEDGER_TEST_ADMIN_DATABASE_URL=postgresql://ledger_admin:<admin-password>@127.0.0.1:5434/ledger_test
 ```
 
-> **Note on Windows Hosts:** Always use `127.0.0.1` rather than `localhost` in database connection strings to avoid IPv6 name resolution delays.
+The test fixtures reject connection URLs configured for port 5432 before connecting. The admin fixture also verifies the database name, marker, and superuser role; the application fixture verifies the runtime role's grants. Keep `.env` local and replace the example passwords with distinct values.
 
 ---
 
 ## Local Setup & Execution
 
 ### Prerequisites
-- Python 3.12+
+- Python 3.12
 - Docker & Docker Compose
-- Windows PowerShell or Bash
+- Windows PowerShell, Linux shell, or macOS shell
 
 ### 1. Initialize Configuration
+
+Windows PowerShell:
 ```powershell
 Copy-Item .env.example .env
-# Edit .env and supply strong passwords for POSTGRES_ADMIN_PASSWORD and LEDGER_APP_PASSWORD
+# Edit .env and replace the example values with distinct local passwords.
 ```
 
-### 2. Start PostgreSQL Container
+Linux/macOS:
+```bash
+cp .env.example .env
+# Edit .env and replace the example values with distinct local passwords.
+```
+
+### 2. Start PostgreSQL
+
+The local library database is bound to `127.0.0.1:5433`; it does not use host port 5432:
 ```powershell
 docker compose up -d --wait
 ```
 
-### 3. Setup Virtual Environment
+### 3. Set Up the Python Environment
+
+Windows PowerShell:
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
+Linux/macOS:
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
 ### 4. Apply Schema Migrations
+
+Windows PowerShell:
 ```powershell
-$env:LEDGER_MIGRATION_DATABASE_URL = "postgresql://ledger_admin:<admin-password>@127.0.0.1:5432/ledger"
-$env:LEDGER_DATABASE_URL = "postgresql://ledger_app:<app-password>@127.0.0.1:5432/ledger"
+$env:LEDGER_MIGRATION_DATABASE_URL = "postgresql://ledger_admin:<admin-password>@127.0.0.1:5433/ledger"
+python -m ledger.migrate
+```
+
+Linux/macOS:
+```bash
+export LEDGER_MIGRATION_DATABASE_URL='postgresql://ledger_admin:<admin-password>@127.0.0.1:5433/ledger'
 python -m ledger.migrate
 ```
 
 ### 5. Using the Python Library
+
+Replace the example IDs with existing owner/account UUIDs; this package does not create owners, accounts, or starting funds.
 ```python
-from uuid import uuid4
 import psycopg
 from ledger import transfer_idempotently, get_balance
 
-with psycopg.connect("postgresql://ledger_app:<app-password>@127.0.0.1:5432/ledger") as conn:
-    # Check balance
+with psycopg.connect("postgresql://ledger_app:<app-password>@127.0.0.1:5433/ledger") as conn:
     balance = get_balance(conn, source_account_id)
-    
-    # Execute safe transfer
     result = transfer_idempotently(
         connection=conn,
         source_account_id=source_account_id,
         destination_account_id=destination_account_id,
-        amount_minor=5000,  # $50.00 in minor units
+        amount_minor=5000,
         created_by=owner_id,
         idempotency_key="tx-req-12345",
     )
-    print("Transfer executed:", result)
+    print(result)
 ```
 
 ---
@@ -361,42 +393,49 @@ with psycopg.connect("postgresql://ledger_app:<app-password>@127.0.0.1:5432/ledg
 ## Automated Testing & Verification
 
 ### Safety Rule for Tests
-All tests that execute database modifications **strictly refuse** to connect to port 5432. They require an isolated database named `ledger_test` on port `5433`, marked with the description `'ledger-experiment-tests-only'`.
+All database tests refuse to connect to host port 5432. They use a separate `ledger_test` database on port `5434`, marked `ledger-experiment-tests-only`. Start it independently from the local library database:
 
-### Starting the Isolated Test Database
+### Start the Ephemeral Test Database
 ```powershell
-$initPath = (Resolve-Path ".\docker\postgres\init").Path
-
-docker run --detach --rm --name ledger-test-postgres `
-  --env POSTGRES_USER=ledger_admin `
-  --env POSTGRES_PASSWORD=<test-admin-password> `
-  --env POSTGRES_DB=ledger_test `
-  --env LEDGER_APP_PASSWORD=<test-app-password> `
-  --publish 127.0.0.1:5433:5432 `
-  --tmpfs /var/lib/postgresql/data:rw,size=512m `
-  --mount "type=bind,source=$initPath,target=/docker-entrypoint-initdb.d,readonly" `
-  postgres:16
-
-# Configure database marker and application role
-docker exec ledger-test-postgres psql -U ledger_admin -d ledger_test `
-  -c "COMMENT ON DATABASE ledger_test IS 'ledger-experiment-tests-only'; CREATE ROLE ledger_app LOGIN PASSWORD '<test-app-password>'; GRANT CONNECT ON DATABASE ledger_test TO ledger_app;"
+docker compose --profile test up -d --wait postgres-test
 ```
 
-### Running Migrations & Test Suites
+Linux/macOS:
+```bash
+docker compose --profile test up -d --wait postgres-test
+```
+
+The test service has its own in-memory `tmpfs` data directory and host port 5434; it does not mount the local ledger database volume. Its initialization script creates the runtime role and database marker.
+
+### Migrate and Run Checks
+
+Windows PowerShell (use the same passwords as in `.env`):
 ```powershell
-$env:LEDGER_MIGRATION_DATABASE_URL = "postgresql://ledger_admin:<test-admin-password>@127.0.0.1:5433/ledger_test"
-$env:LEDGER_DATABASE_URL = "postgresql://ledger_app:<test-app-password>@127.0.0.1:5433/ledger_test"
+$env:LEDGER_MIGRATION_DATABASE_URL = "postgresql://ledger_admin:<admin-password>@127.0.0.1:5434/ledger_test"
+$env:LEDGER_DATABASE_URL = "postgresql://ledger_app:<app-password>@127.0.0.1:5434/ledger_test"
 $env:LEDGER_TEST_ADMIN_DATABASE_URL = $env:LEDGER_MIGRATION_DATABASE_URL
 
-# 1. Apply migrations to test DB
 python -m ledger.migrate
-
-# 2. Run full pytest suite (33 tests)
 python -m pytest -v
-
-# 3. Static code analysis and type checks
 ruff check .
 mypy src tests
+```
+
+Linux/macOS:
+```bash
+export LEDGER_MIGRATION_DATABASE_URL='postgresql://ledger_admin:<admin-password>@127.0.0.1:5434/ledger_test'
+export LEDGER_DATABASE_URL='postgresql://ledger_app:<app-password>@127.0.0.1:5434/ledger_test'
+export LEDGER_TEST_ADMIN_DATABASE_URL="$LEDGER_MIGRATION_DATABASE_URL"
+
+python -m ledger.migrate
+python -m pytest -v
+ruff check .
+mypy src tests
+```
+
+Remove only the isolated test database container when finished (the local library database is left running):
+```shell
+docker compose --profile test rm --stop --force postgres-test
 ```
 
 ---
@@ -406,8 +445,12 @@ mypy src tests
 1. **Single-Currency Ledger:**
    The current schema handles one abstract minor currency unit (`BIGINT`). It does not store currency codes (e.g., USD, EUR) or support multi-currency foreign exchange (FX) settlement entries.
 2. **Balance Aggregation at Scale:**
-   Balances are computed dynamically via `SUM(amount_minor)`. While high-performance indexes `(account_id, id)` support fast aggregation for thousands of transactions, high-throughput accounts with millions of entries require periodic balance checkpoints/snapshots.
-3. **In-Process Interface vs REST API:**
-   The service is currently consumed as a Python library. Declared dependencies include FastAPI and Uvicorn. Exposing a REST API requires adding HTTP request validation, authentication middleware (e.g., JWT/mTLS to identify `owner_id`), and an asynchronous Psycopg connection pool.
-4. **Single-Cluster PostgreSQL:**
-   The row-locking and trigger guarantees rely on PostgreSQL's single-node serializable capabilities. Scaling horizontally across sharded database engines would require two-phase commit (2PC) or distributed consensus coordination (e.g., Raft).
+   Balances are recomputed by summing immutable entries. The `(account_id, id)` index helps, but aggregation cost and index/storage growth increase with ledger history; high-volume accounts may need a carefully designed checkpoint/snapshot strategy. No benchmark or supported scale threshold is claimed.
+3. **No HTTP or Identity Layer:**
+   This repository exposes a Python library only. It has no REST API or authentication; a future network-facing service would need request validation, authenticated identity, and connection lifecycle controls.
+4. **Funding and Withdrawals:**
+   There is no supported deposit, withdrawal, or account funding operation. These require explicit product/accounting rules and should not be inferred from raw entry insertion or `allow_negative`.
+5. **Database Trust Boundary:**
+   Role grants protect the ordinary application connection, not against PostgreSQL superusers or privileged database owners. `created_by` is not authenticated, and the database does not enforce transfer ownership/overdraft policy for arbitrary direct inserts by `ledger_app`.
+6. **Single-Cluster PostgreSQL:**
+   The transfer path uses PostgreSQL row-level locks at the configured/default transaction isolation; this is not a claim of SERIALIZABLE isolation or distributed transaction guarantees.

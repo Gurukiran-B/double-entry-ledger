@@ -15,13 +15,14 @@ def test_admin_database_url() -> str:
             "for the isolated ledger_test database."
         )
 
-    with psycopg.connect(database_url) as connection:
-        if connection.info.port == 5432:
-            pytest.fail("Test admin connections must not use port 5432.")
+    connection_info = psycopg.conninfo.conninfo_to_dict(database_url)
+    port = connection_info.get("port")
+    if port is None or str(port) == "5432":
+        pytest.fail("Test admin connections must not use port 5432.")
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
+    with psycopg.connect(database_url) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
                     SELECT
                         current_database(),
                         role.rolsuper,
@@ -33,8 +34,8 @@ def test_admin_database_url() -> str:
                     FROM pg_roles AS role
                     WHERE role.rolname = current_user
                 """
-            )
-            row = cursor.fetchone()
+        )
+        row = cursor.fetchone()
 
     if (
         row is None

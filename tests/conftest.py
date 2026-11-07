@@ -15,13 +15,14 @@ def require_disposable_application_database(
 
     from ledger.config import DATABASE_URL
 
-    with psycopg.connect(DATABASE_URL) as connection:
-        if connection.info.port == 5432:
-            pytest.fail("Tests must not connect to PostgreSQL on port 5432.")
+    connection_info = psycopg.conninfo.conninfo_to_dict(DATABASE_URL)
+    port = connection_info.get("port")
+    if port is None or str(port) == "5432":
+        pytest.fail("Tests must not connect to PostgreSQL on port 5432.")
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
+    with psycopg.connect(DATABASE_URL) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
                 SELECT
                     current_database(),
                     current_user,
@@ -63,8 +64,8 @@ def require_disposable_application_database(
                 FROM pg_roles AS role
                 WHERE role.rolname = current_user
                 """
-            )
-            row = cursor.fetchone()
+        )
+        row = cursor.fetchone()
 
     if row is None:
         pytest.fail("The application database role is missing from pg_roles.")

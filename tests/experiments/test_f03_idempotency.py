@@ -14,6 +14,10 @@ from ledger.transfer import (
 )
 
 
+class DeliberateFailure(RuntimeError):
+    pass
+
+
 def test_retry_returns_original_transaction_without_double_debit(
     test_admin_database_url: str,
 ) -> None:
@@ -78,6 +82,34 @@ def test_retry_returns_original_transaction_without_double_debit(
 
             connection.commit()
 
+            def fail_after_claim() -> None:
+                raise DeliberateFailure("fail after claiming the key")
+
+            # A failed request must roll back its uncommitted key claim.
+            with pytest.raises(DeliberateFailure, match="fail after claiming"):
+                transfer_idempotently(
+                    connection,
+                    source_id,
+                    destination_id,
+                    500,
+                    owner_id,
+                    idempotency_key,
+                    after_lock=fail_after_claim,
+                )
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger.idempotency_keys
+                    WHERE owner_id = %s AND key = %s
+                    """,
+                    (owner_id, idempotency_key),
+                )
+                row = cursor.fetchone()
+                assert row is not None
+                assert row[0] == 0
+
             # First request commits the transfer.
             first = transfer_idempotently(
                 connection,
@@ -103,10 +135,19 @@ def test_retry_returns_original_transaction_without_double_debit(
             assert second["status"] == 201
             assert second["replayed"] is True
 
-            assert (
-                first["body"]["transaction_id"]
-                == second["body"]["transaction_id"]
-            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT response_status, response_body
+                    FROM ledger.idempotency_keys
+                    WHERE owner_id = %s AND key = %s
+                    """,
+                    (owner_id, idempotency_key),
+                )
+                saved_response = cursor.fetchone()
+
+            assert saved_response == (first["status"], first["body"])
+            assert (second["status"], second["body"]) == saved_response
 
             transfer_id = first["body"]["transaction_id"]
 

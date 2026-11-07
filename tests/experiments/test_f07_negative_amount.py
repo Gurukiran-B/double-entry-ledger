@@ -1,4 +1,3 @@
-
 """F7: Verify non-positive transfer amounts are rejected."""
 
 from uuid import uuid4
@@ -7,7 +6,7 @@ import psycopg
 import pytest
 
 from ledger.config import DATABASE_URL
-from ledger.transfer import transfer
+from ledger.transfer import InsufficientFundsError, transfer
 
 
 def test_negative_amount_is_rejected_without_ledger_writes(
@@ -151,3 +150,63 @@ def test_negative_amount_is_rejected_without_ledger_writes(
                         (owner_id,),
                     )
                 cleanup.commit()
+
+
+def test_allow_negative_does_not_permit_overdraft(
+    test_admin_database_url: str,
+) -> None:
+    owner_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+
+    try:
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO ledger.owners (id, name) VALUES (%s, %s)",
+                    (owner_id, "F7 allow-negative test"),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO ledger.accounts (id, owner_id, name, allow_negative)
+                    VALUES (%s, %s, %s, TRUE), (%s, %s, %s, FALSE)
+                    """,
+                    (
+                        source_id,
+                        owner_id,
+                        "F7 negative source",
+                        destination_id,
+                        owner_id,
+                        "F7 destination",
+                    ),
+                )
+
+            with pytest.raises(InsufficientFundsError, match="Insufficient funds"):
+                transfer(connection, source_id, destination_id, 1, owner_id)
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM ledger.transactions
+                    WHERE created_by = %s
+                    """,
+                    (owner_id,),
+                )
+                row = cursor.fetchone()
+                assert row is not None
+                assert row[0] == 0
+
+    finally:
+        with (
+            psycopg.connect(test_admin_database_url) as cleanup,
+            cleanup.cursor() as cursor,
+        ):
+            cursor.execute(
+                "DELETE FROM ledger.accounts WHERE owner_id = %s",
+                (owner_id,),
+            )
+            cursor.execute(
+                "DELETE FROM ledger.owners WHERE id = %s",
+                (owner_id,),
+            )
